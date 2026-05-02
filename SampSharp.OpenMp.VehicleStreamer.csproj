@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <RootNamespace>SampSharp.VehicleStreamer.Entities</RootNamespace>
+        <AssemblyName>SampSharp.OpenMp.VehicleStreamer</AssemblyName>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\SampSharp\src\SampSharp.OpenMp.Core\SampSharp.OpenMp.Core.csproj" />
+        <ProjectReference Include="..\SampSharp\src\SampSharp.OpenMp.Entities\SampSharp.OpenMp.Entities.csproj" />
+    </ItemGroup>
+
+</Project>
