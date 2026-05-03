@@ -301,7 +301,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         v.State.DamageLights = l;
         v.State.DamageTires = t;
 
-        var (c1, c2) = native.GetColours();
+        var (c1, c2) = native.Colors;
         v.State.PrimaryColor = c1;
         v.State.SecondaryColor = c2;
 
