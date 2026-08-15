@@ -18,6 +18,13 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
     private readonly List<StreamedVehicle> _all = new();
     private readonly Dictionary<(int X, int Y), List<StreamedVehicle>> _grid = new();
+
+    // Per-tick scratch, kept as fields so a 1 Hz tick doesn't allocate three
+    // collections every time. Cleared at the point of use, never read across ticks.
+    private readonly HashSet<StreamedVehicle> _touched = new();
+    private readonly Dictionary<StreamedVehicle, float> _pending = new();
+    private readonly List<KeyValuePair<StreamedVehicle, float>> _spawnOrder = new();
+
     private float _maxStreamDistance;
     private long _tick;
 
@@ -113,8 +120,8 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             ? 1
             : (int)MathF.Ceiling(maxOutDistance / _options.CellSize);
 
-        var touched = new HashSet<StreamedVehicle>();
-        var spawnedThisTick = 0;
+        _touched.Clear();
+        _pending.Clear();
 
         foreach (var observer in observers)
         {
@@ -139,38 +146,39 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
                     if (distSq <= inDistance * inDistance)
                     {
-                        if (!v.IsLive)
+                        if (v.IsLive)
                         {
-                            // Throttle spawns per tick: entering a dense area would
-                            // otherwise fire a burst of reliable CreateVehicle + state
-                            // RPCs at once, tripping open.mp's per-client acks_limit
-                            // (disconnect + temp-ban) and crashing the client. Records
-                            // skipped this tick are picked up on subsequent ticks.
-                            if (_options.MaxSpawnsPerTick > 0 && spawnedThisTick >= _options.MaxSpawnsPerTick)
-                                continue;
-                            SpawnNative(v);
-                            spawnedThisTick++;
+                            _touched.Add(v);
+                            v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
                         }
-
-                        touched.Add(v);
-                        v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
+                        else
+                        {
+                            // Collect rather than spawn here: SpawnNative may re-bucket
+                            // the record, and that mutates the very grid list this loop
+                            // is enumerating. Remember the closest observer's distance
+                            // so a capped tick can spend its budget on the nearest.
+                            if (!_pending.TryGetValue(v, out var best) || distSq < best)
+                                _pending[v] = distSq;
+                        }
                     }
                     else if (v.IsLive && distSq <= outDistance * outDistance)
                     {
                         // Hysteresis band: keep the live native, defer despawn.
-                        touched.Add(v);
+                        _touched.Add(v);
                         v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
                     }
                 }
             }
         }
 
+        SpawnPending();
+
         // ReSharper disable once ForeachCanBePartlyConvertedToQueryUsingAnotherGetEnumerator
         foreach (var v in _all)
         {
             if (!v.IsLive) continue;
             if (v.IsPinned) continue;
-            if (touched.Contains(v)) continue;
+            if (_touched.Contains(v)) continue;
             if (_tick < v.EarliestDespawnTick) continue;
 
             if (_options.KeepOccupiedVehicles && IsOccupied(v.Native!))
@@ -180,6 +188,39 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             }
 
             DestroyNative(v);
+        }
+    }
+
+    /// <summary>
+    /// Phase two of <see cref="Tick"/>: create the natives the grid scan asked for.
+    /// Deliberately runs after the scan — <see cref="SpawnNative"/> can re-bucket a
+    /// record, which mutates a grid list and would break the scan's enumeration.
+    /// </summary>
+    private void SpawnPending()
+    {
+        if (_pending.Count == 0) return;
+
+        _spawnOrder.Clear();
+        foreach (var pending in _pending)
+            _spawnOrder.Add(pending);
+
+        var budget = _options.MaxSpawnsPerTick;
+        if (budget > 0 && _spawnOrder.Count > budget)
+        {
+            // Over budget: spawn the nearest first, since those are what observers
+            // are most likely to be looking at. The rest are retried next tick.
+            _spawnOrder.Sort(static (a, b) => a.Value.CompareTo(b.Value));
+            _spawnOrder.RemoveRange(budget, _spawnOrder.Count - budget);
+        }
+
+        foreach (var (v, _) in _spawnOrder)
+        {
+            // A consumer's OnSpawn may have force-spawned this record already.
+            if (v.IsLive) continue;
+
+            SpawnNative(v);
+            _touched.Add(v);
+            v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
         }
     }
 
@@ -193,16 +234,17 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             {
                 // Native disappeared without our involvement — forget it; the next
                 // observer scan will respawn at the anchor with our captured state.
+                // Snap the bucket back onto that captured state: the record may have
+                // been re-bucketed to wherever it was last driven, and leaving Cell
+                // out of sync with State.Position both hides it from scans near its
+                // real position and desyncs the grid.
                 v.Native = null;
+                Rebucket(v, ToCell(v.State.Position));
                 continue;
             }
 
             // Re-bucket if the live vehicle drove into another cell.
-            var freshCell = ToCell(v.Native.Position);
-            if (freshCell == v.Cell) continue;
-            Unbucket(v);
-            v.Cell = freshCell;
-            BucketAt(v, freshCell);
+            Rebucket(v, ToCell(v.Native.Position));
         }
     }
 
@@ -265,11 +307,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
         // The vehicle may have been driven before destroy; ensure its grid bucket
         // reflects the captured position, not the anchor.
-        var freshCell = ToCell(v.State.Position);
-        if (freshCell == v.Cell) return native;
-        Unbucket(v);
-        v.Cell = freshCell;
-        BucketAt(v, freshCell);
+        Rebucket(v, ToCell(v.State.Position));
 
         return native;
     }
@@ -295,11 +333,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
         // Snap the bucket to the captured position so the next observer scan
         // checks the right cell — important if the vehicle drove far away.
-        var freshCell = ToCell(v.State.Position);
-        if (freshCell == v.Cell) return;
-        Unbucket(v);
-        v.Cell = freshCell;
-        BucketAt(v, freshCell);
+        Rebucket(v, ToCell(v.State.Position));
     }
 
     private static void CaptureState(StreamedVehicle v, Vehicle native)
@@ -376,5 +410,18 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         if (!_grid.TryGetValue(v.Cell, out var list)) return;
         list.Remove(v);
         if (list.Count == 0) _grid.Remove(v.Cell);
+    }
+
+    /// <summary>
+    /// Moves a record into <paramref name="cell"/>, no-op when it is already there.
+    /// Mutates <c>_grid</c>, so it must never run while a grid bucket is being
+    /// enumerated — see <see cref="SpawnPending"/>.
+    /// </summary>
+    private void Rebucket(StreamedVehicle v, (int X, int Y) cell)
+    {
+        if (cell == v.Cell) return;
+        Unbucket(v);
+        v.Cell = cell;
+        BucketAt(v, cell);
     }
 }
