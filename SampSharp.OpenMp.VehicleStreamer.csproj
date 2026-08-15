@@ -9,8 +9,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\SampSharp\src\SampSharp.OpenMp.Core\SampSharp.OpenMp.Core.csproj" />
-        <ProjectReference Include="..\SampSharp\src\SampSharp.OpenMp.Entities\SampSharp.OpenMp.Entities.csproj" />
+        <ProjectReference Include="..\..\SampSharp\src\SampSharp.OpenMp.Core\SampSharp.OpenMp.Core.csproj" />
+        <ProjectReference Include="..\..\SampSharp\src\SampSharp.OpenMp.Entities\SampSharp.OpenMp.Entities.csproj" />
     </ItemGroup>
 
 </Project>
