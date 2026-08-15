@@ -30,4 +30,15 @@ public sealed class VehicleStreamerOptions
 
     /// <summary>If true, occupied vehicles are exempt from despawning regardless of distance.</summary>
     public bool KeepOccupiedVehicles { get; set; } = true;
+
+    /// <summary>
+    /// Maximum number of native vehicles the streamer may spawn in a single
+    /// <see cref="VehicleStreamerService.Tick"/>. Caps the burst of reliable
+    /// CreateVehicle + state RPCs sent when an observer enters a dense area — an
+    /// uncapped burst can exceed open.mp's per-client <c>acks_limit</c> (which
+    /// disconnects and temporarily bans the player) and overload the SA-MP client.
+    /// Records deferred this tick are spawned on subsequent ticks. <c>0</c>
+    /// disables the cap. With the default 1 Hz tick, 30 ≈ 30 vehicles/second.
+    /// </summary>
+    public int MaxSpawnsPerTick { get; set; } = 30;
 }

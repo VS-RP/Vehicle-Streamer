@@ -114,6 +114,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             : (int)MathF.Ceiling(maxOutDistance / _options.CellSize);
 
         var touched = new HashSet<StreamedVehicle>();
+        var spawnedThisTick = 0;
 
         foreach (var observer in observers)
         {
@@ -138,7 +139,19 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
                     if (distSq <= inDistance * inDistance)
                     {
-                        if (!v.IsLive) SpawnNative(v);
+                        if (!v.IsLive)
+                        {
+                            // Throttle spawns per tick: entering a dense area would
+                            // otherwise fire a burst of reliable CreateVehicle + state
+                            // RPCs at once, tripping open.mp's per-client acks_limit
+                            // (disconnect + temp-ban) and crashing the client. Records
+                            // skipped this tick are picked up on subsequent ticks.
+                            if (_options.MaxSpawnsPerTick > 0 && spawnedThisTick >= _options.MaxSpawnsPerTick)
+                                continue;
+                            SpawnNative(v);
+                            spawnedThisTick++;
+                        }
+
                         touched.Add(v);
                         v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
                     }
