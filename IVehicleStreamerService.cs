@@ -32,7 +32,10 @@ public interface IVehicleStreamerService
     /// </summary>
     bool Unregister(StreamedVehicle vehicle);
 
-    /// <summary>Enumerate every registered record, live or dormant.</summary>
+    /// <summary>
+    /// Enumerate every registered record, live or dormant. The result is a snapshot,
+    /// so calling <see cref="Unregister"/> while iterating it is safe.
+    /// </summary>
     IEnumerable<StreamedVehicle> All();
 
     /// <summary>

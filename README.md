@@ -47,6 +47,25 @@ and tick loop run entirely in C# on top of `IWorldService`.
 consumer can attach ECS components, restore custom state, write/read its `Tag`
 without the library knowing anything about gamemode types.
 
+## Diagnostics
+
+A tick must not die because one record or one consumer callback threw, so the
+streamer swallows those exceptions — but it reports them through an optional
+`ILogger<VehicleStreamerService>`, injected automatically when the host has
+logging registered. Without a logger, a throwing `OnSpawn`/`OnDespawn` or a
+record that cannot be spawned fails silently.
+
+## Burst control
+
+`MaxSpawnsPerTick` (default 30) caps how many natives one tick may create. An
+observer entering a dense area would otherwise issue a reliable `CreateVehicle`
+plus a burst of state RPCs for every record at once, which can exceed open.mp's
+per-client `acks_limit` — that disconnects and temporarily bans the player. When
+a tick is over budget the nearest records win and the rest are retried next tick.
+
+`MaxDespawnsPerTick` is the mirror image and is **off** by default; see its
+documentation for why capping despawns is the riskier of the two.
+
 ## Anchor semantics
 
 `Register` records the position you pass in as the **anchor**. Every time the

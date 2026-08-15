@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using Microsoft.Extensions.Logging;
 using SampSharp.Entities.SAMP;
 
 namespace SampSharp.VehicleStreamer.Entities;
@@ -15,6 +16,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 {
     private readonly IWorldService _world;
     private readonly VehicleStreamerOptions _options;
+    private readonly ILogger<VehicleStreamerService>? _logger;
 
     private readonly List<StreamedVehicle> _all = new();
     private readonly Dictionary<(int X, int Y), List<StreamedVehicle>> _grid = new();
@@ -33,13 +35,20 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
     /// </summary>
     /// <param name="world">World service used to create native open.mp vehicles.</param>
     /// <param name="options">Tuning knobs (cell size, hysteresis, grace period).</param>
-    public VehicleStreamerService(IWorldService world, VehicleStreamerOptions options)
+    /// <param name="logger">
+    /// Optional. Receives the exceptions the streamer has to swallow to keep ticking:
+    /// throwing consumer callbacks and records that fail to spawn or despawn. Without
+    /// it those failures are invisible. Resolved from DI when logging is registered.
+    /// </param>
+    public VehicleStreamerService(IWorldService world, VehicleStreamerOptions options,
+        ILogger<VehicleStreamerService>? logger = null)
     {
         ArgumentNullException.ThrowIfNull(world);
         ArgumentNullException.ThrowIfNull(options);
 
         _world = world;
         _options = options;
+        _logger = logger;
     }
 
     /// <inheritdoc />
@@ -65,11 +74,11 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         if (info.StreamDistance <= 0)
             throw new ArgumentException("StreamDistance must be > 0.", nameof(info));
 
+        // _maxStreamDistance is not touched here — ReconcileRecords recomputes it at
+        // the top of every tick, which is the only place that can also see it shrink.
         var vehicle = new StreamedVehicle(this, info);
         _all.Add(vehicle);
         Bucket(vehicle);
-        if (info.StreamDistance > _maxStreamDistance)
-            _maxStreamDistance = info.StreamDistance;
         return vehicle;
     }
 
@@ -83,7 +92,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
     }
 
     /// <inheritdoc />
-    public IEnumerable<StreamedVehicle> All() => _all;
+    public IEnumerable<StreamedVehicle> All() => _all.ToArray();
 
     /// <inheritdoc />
     public Vehicle? ForceSpawn(StreamedVehicle vehicle)
@@ -108,8 +117,9 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
         // Drop dangling natives — open.mp may have destroyed them under us
         // (admin /destroy, sudden Vehicle.Respawn, etc.). Re-bucket lives that drove
-        // off into a different cell so observer scans pick them up correctly.
-        ReconcileLiveRecords();
+        // off into a different cell so observer scans pick them up correctly, and
+        // refresh the scan radius.
+        ReconcileRecords();
 
         var observers = players?.Where(static p => p is { IsComponentAlive: true }).ToArray()
                         ?? [];
@@ -173,6 +183,9 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
 
         SpawnPending();
 
+        var despawnBudget = _options.MaxDespawnsPerTick;
+        var despawned = 0;
+
         // ReSharper disable once ForeachCanBePartlyConvertedToQueryUsingAnotherGetEnumerator
         foreach (var v in _all)
         {
@@ -180,14 +193,25 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             if (v.IsPinned) continue;
             if (_touched.Contains(v)) continue;
             if (_tick < v.EarliestDespawnTick) continue;
+            if (despawnBudget > 0 && despawned >= despawnBudget) break;
 
-            if (_options.KeepOccupiedVehicles && IsOccupied(v.Native!))
+            try
             {
-                v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
-                continue;
-            }
+                if (_options.KeepOccupiedVehicles && IsOccupied(v.Native!))
+                {
+                    v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
+                    continue;
+                }
 
-            DestroyNative(v);
+                DestroyNative(v);
+                despawned++;
+            }
+            catch (Exception e)
+            {
+                // One unusable record must not cost the rest of the tick. Leave the
+                // record live; the next tick will try again.
+                _logger?.LogError(e, "Vehicle streamer failed to despawn {Record}", v);
+            }
         }
     }
 
@@ -218,16 +242,39 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
             // A consumer's OnSpawn may have force-spawned this record already.
             if (v.IsLive) continue;
 
-            SpawnNative(v);
+            try
+            {
+                SpawnNative(v);
+            }
+            catch (Exception e)
+            {
+                // One unusable record must not cost the rest of the tick.
+                _logger?.LogError(e, "Vehicle streamer failed to spawn {Record}", v);
+                continue;
+            }
+
             _touched.Add(v);
             v.EarliestDespawnTick = _tick + _options.DespawnTickGrace;
         }
     }
 
-    private void ReconcileLiveRecords()
+    /// <summary>
+    /// Start-of-tick pass over every record. Drops natives open.mp destroyed behind
+    /// our back, keeps grid buckets in step with where vehicles actually are, and
+    /// recomputes <c>_maxStreamDistance</c>, which sets the scan radius: deriving it
+    /// incrementally would only ever let it grow, since both <see cref="Unregister"/>
+    /// and a runtime <see cref="StreamedVehicle.StreamDistance"/> change can lower it,
+    /// and a single stale long-range record inflates the scan by (2r+1)² cells.
+    /// </summary>
+    private void ReconcileRecords()
     {
+        _maxStreamDistance = 0f;
+
         foreach (var v in _all)
         {
+            if (v.StreamDistance > _maxStreamDistance)
+                _maxStreamDistance = v.StreamDistance;
+
             if (v.Native is null) continue;
 
             if (!v.Native.IsComponentAlive)
@@ -268,7 +315,7 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         // Apply captured state. Skip the no-op cases on first spawn so we don't
         // waste calls when the record is fresh.
         if (v.Interior > 0)
-            native.LinkToInterior(v.Interior);
+            native.Interior = v.Interior;
         if (v.VirtualWorld >= 0)
             native.VirtualWorld = v.VirtualWorld;
 
@@ -303,7 +350,13 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         v.Native = native;
 
         try { v.OnSpawn?.Invoke(v, native); }
-        catch { /* surfaced via consumer logging — don't kill the streamer tick */ }
+        catch (Exception e)
+        {
+            // A throwing consumer callback must not kill the tick, but swallowing it
+            // silently made gamemode bugs invisible — the native is already live and
+            // the streamer carries on regardless of what the callback did.
+            _logger?.LogError(e, "OnSpawn callback threw for {Record}", v);
+        }
 
         // The vehicle may have been driven before destroy; ensure its grid bucket
         // reflects the captured position, not the anchor.
@@ -318,9 +371,11 @@ public sealed class VehicleStreamerService : IVehicleStreamerService
         if (native is null) return;
 
         try { v.OnDespawn?.Invoke(v, native); }
-        catch
+        catch (Exception e)
         {
-            // ignored
+            // Same as OnSpawn: the despawn proceeds either way, but the consumer's
+            // failure to capture its own state is worth knowing about.
+            _logger?.LogError(e, "OnDespawn callback threw for {Record}", v);
         }
 
         if (native.IsComponentAlive)

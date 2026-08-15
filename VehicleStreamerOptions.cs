@@ -41,4 +41,20 @@ public sealed class VehicleStreamerOptions
     /// disables the cap. With the default 1 Hz tick, 30 ≈ 30 vehicles/second.
     /// </summary>
     public int MaxSpawnsPerTick { get; set; } = 30;
+
+    /// <summary>
+    /// Maximum number of native vehicles the streamer may destroy in a single
+    /// <see cref="VehicleStreamerService.Tick"/>. <c>0</c> — the default — disables
+    /// the cap.
+    /// <para>
+    /// The counterpart to <see cref="MaxSpawnsPerTick"/>: a group of observers
+    /// leaving an area at once produces a burst of destroy RPCs. That burst is far
+    /// less dangerous than the stream-in one, which is why this is off by default —
+    /// capping despawns keeps natives alive longer, and the engine's global vehicle
+    /// limit (~2000) is exactly what the streamer exists to stay under. Only raise
+    /// it above zero if destroy bursts are demonstrably hurting clients, and keep it
+    /// comfortably larger than <see cref="MaxSpawnsPerTick"/>.
+    /// </para>
+    /// </summary>
+    public int MaxDespawnsPerTick { get; set; }
 }
