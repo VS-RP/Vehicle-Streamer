@@ -116,4 +116,8 @@ No native dependency.
 
 ## License
 
-Apache-2.0.
+Apache-2.0 -- see [LICENSE](LICENSE).
+
+---
+
+Powered by [vs-rp.org](https://vs-rp.org)
